@@ -1,18 +1,43 @@
 #include <Arduino.h>
+#include "lora_app.h"
 
-// put function declarations here:
-int myFunction(int, int);
+#define LORA_CS     5
+#define LORA_RST    14
+#define LORA_DIO0   26
+#define LORA_FREQ   433E6
 
-void setup() {
-  // put your setup code here, to run once:
-  int result = myFunction(2, 3);
+void setup()
+{
+    Serial.begin(115200);
+    while (!Serial);
+
+    Serial.println("ESP32 Transmitter Ready");
+
+    if (!esp32_tx_init(LORA_FREQ, LORA_CS, LORA_RST, LORA_DIO0))
+    {
+        Serial.println("LoRa INIT FAILED");
+        while (1);
+    }
+
+    Serial.println("LoRa INIT SUCCESS");
 }
 
-void loop() {
-  // put your main code here, to run repeatedly:
-}
+void loop()
+{
+    if (Serial.available())
+    {
+        String msg = Serial.readStringUntil('\n');
+        msg.trim();
 
-// put function definitions here:
-int myFunction(int x, int y) {
-  return x + y;
+        if (msg.length() > 0)
+        {
+            bool status = esp32_tx_sendText(msg);
+
+            Serial.print("Sent: ");
+            Serial.print(msg);
+            Serial.print(" [");
+            Serial.print(status ? "OK" : "FAIL");
+            Serial.println("]");
+        }
+    }
 }
