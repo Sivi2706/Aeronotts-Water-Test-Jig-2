@@ -1,5 +1,4 @@
 # Aeronotts-Water-Test-Jig-2
-# PinOuts 
 ## ESP 32 
 ### RF Transciever
 
