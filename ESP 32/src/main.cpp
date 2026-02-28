@@ -1,46 +1,119 @@
 #include <Arduino.h>
-#include "esp32_gps_rf_tx.h"
+#include "esp_air_pins.h"
+#include "esp_air_gps.h"
+#include "esp_air_bmi160.h"
+#include "esp_air_bmp280.h"
+#include "esp_air_sdlog.h"
+#include "esp_air_lora_tx.h"
+#include "esp_air_time.h"
 
-// LoRa pins (same as before)
-#define LORA_CS     5
-#define LORA_RST    14
-#define LORA_DIO0   26
-#define LORA_FREQ   433E6
 
-// GPS pins (NEO-8M)
-#define GPS_RX_PIN  16   // ESP32 RX (connect to GPS TX)
-#define GPS_TX_PIN  17   // ESP32 TX (connect to GPS RX) optional
-#define GPS_BAUD    9600
+static constexpr long LORA_FREQ_HZ = 915E6;     // change to 433E6 / 868E6 / 915E6
+static constexpr float SEA_LEVEL_HPA = 1013.25f;
 
-static uint32_t lastTxMs = 0;
-static const uint32_t TX_PERIOD_MS = 1000;
+static EspSdFiles g_sd;
+static uint32_t g_lastStatusMs = 0;
+
+static void espAir_printCsvHeader() {
+  Serial.println("ESP32 GPS + IMU + BMP -> LoRa TX + SD log starting...");
+  Serial.println("CSV: ms,fix,lat,lng,alt_m,spd_kmph,hdop,sats,utc_hhmmss,utc_ddmmyy");
+}
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial) {}
+  delay(200);
 
-  Serial.println("ESP32 GPS -> LoRa TX starting...");
+  espAir_printCsvHeader();
 
-  if (!esp32_gpsrf_init(LORA_FREQ, LORA_CS, LORA_RST, LORA_DIO0,
-                        GPS_RX_PIN, GPS_TX_PIN, GPS_BAUD)) {
-    Serial.println("Init FAILED. Check LoRa wiring/power/frequency.");
-    while (1) delay(1000);
+  // Start subsystems
+  espGps_begin();
+
+  bool imuOk = espImu_begin();
+  bool bmpOk = espBmp_begin();
+
+  if (!espLoRaTx_begin(LORA_FREQ_HZ)) {
+    Serial.println("LoRa init FAILED");
+  } else {
+    Serial.println("LoRa init OK");
   }
 
-  Serial.println("Init OK.");
-  Serial.println("Sending CSV over LoRa at 1 Hz.");
-  Serial.println("NOFIX CSV: ms,NOFIX,chars,sentFix,sats,hdop");
-  Serial.println("FIX   CSV: ms,FIX,lat,lng,alt_m,spd_kmph,sats,hdop,utc_hhmmss,utc_ddmmyy");
+  if (!espSd_beginAndCreateLog(g_sd)) {
+    Serial.println("SD init FAILED (check wiring/CS)");
+  } else {
+    Serial.print("SD log folder: ");
+    Serial.println(g_sd.folder);
+  }
+
+  Serial.print("IMU ok: "); Serial.println(imuOk ? "YES" : "NO");
+  Serial.print("BMP ok: "); Serial.println(bmpOk ? "YES" : "NO");
+
+  g_lastStatusMs = millis();
 }
 
 void loop() {
-  esp32_gpsrf_poll();
+  const uint32_t now = millis();
 
-  uint32_t now = millis();
-  if (now - lastTxMs >= TX_PERIOD_MS) {
-    lastTxMs = now;
+  // Always keep parsing GPS stream
+  espGps_poll();
 
-    bool ok = esp32_gpsrf_send_packet_csv();
-    Serial.println(ok ? "\nTX packet sent" : "\nTX send failed");
+  // 1) Read IMU + BMP at whatever loop speed you get (raw logging)
+  // Use one synced timestamp per loop tick:
+  char tbuf[16];
+  espTime_formatMmSsMs(now, tbuf, sizeof(tbuf));
+
+  // IMU raw line
+  EspImuRaw imu = espImu_readRaw();
+  if (imu.ok) {
+    char line[96];
+    snprintf(line, sizeof(line), "%s,%d,%d,%d,%d,%d,%d",
+             tbuf, imu.ax, imu.ay, imu.az, imu.gx, imu.gy, imu.gz);
+    espSd_appendLine(g_sd.imuPath.c_str(), line);
+  }
+
+  // BMP line
+  EspBmpSample bmp = espBmp_read(SEA_LEVEL_HPA);
+  if (bmp.ok) {
+    char line[96];
+    snprintf(line, sizeof(line), "%s,%.2f,%.2f,%.2f",
+             tbuf, bmp.temp_C, bmp.press_hPa, bmp.alt_m);
+    espSd_appendLine(g_sd.bmpPath.c_str(), line);
+  }
+
+  // 2) Every 1 second: send status to ground station (GPS + summary)
+  if (now - g_lastStatusMs >= 1000) {
+    g_lastStatusMs = now;
+
+    EspGpsFix fix = espGps_getLatestFix();
+
+    char payload[160];
+    if (!fix.valid) {
+      snprintf(payload, sizeof(payload),
+               "%lu,NOFIX,0,0,0,0,0,0,0,0",
+               (unsigned long)now);
+      Serial.println("TX: no valid GPS fix yet");
+    } else {
+      snprintf(payload, sizeof(payload),
+               "%lu,FIX,%.6f,%.6f,%.2f,%.2f,%.2f,%lu,%lu,%lu",
+               (unsigned long)now,
+               fix.lat, fix.lng, fix.alt_m, fix.spd_kmph, fix.hdop,
+               (unsigned long)fix.sats,
+               (unsigned long)fix.utc_hhmmss,
+               (unsigned long)fix.utc_ddmmyy);
+
+      Serial.print("TX: ");
+      Serial.println(payload);
+    }
+
+    // Log GPS status once per second too (synced timestamp string + ms)
+    {
+      char gpsLine[200];
+      snprintf(gpsLine, sizeof(gpsLine),
+               "%s,%s",
+               tbuf, payload);
+      espSd_appendLine(g_sd.gpsPath.c_str(), gpsLine);
+    }
+
+    // Transmit over LoRa
+    espLoRaTx_sendLine(payload);
   }
 }
