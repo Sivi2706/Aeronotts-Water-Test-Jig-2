@@ -120,3 +120,4 @@ void loop() {
   Serial.print(az, 4); Serial.print(",");
   Serial.println(amag, 4);
 }
+
