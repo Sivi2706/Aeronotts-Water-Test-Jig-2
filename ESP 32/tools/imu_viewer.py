@@ -8,42 +8,28 @@ from vpython import canvas, box, vector, rate, color, arrow, label
 
 BAUD = 115200
 
-# Quaternion display smoothing (0..1)
+# ---------- Display ----------
 Q_ALPHA = 0.25
-
-# Rotate the model +90° yaw initially
 MODEL_YAW_OFFSET_DEG = 90.0
 
-# Acceleration arrow scaling (bigger = longer arrow)
-ACC_SCALE = 0.18
+ACC_SCALE = 0.18     # arrow length ~ ACC_SCALE * |a|
+LIN_SCALE = 0.22     # arrow length ~ LIN_SCALE * |a_lin|
+VEL_SCALE = 0.55     # arrow length ~ VEL_SCALE * |v|
 
-G0 = 9.80665  # m/s^2
+# ---------- Gravity + velocity estimation ----------
+# gravity estimate as LOW-PASS of a_world
+G_LP_ALPHA = 0.02    # smaller = slower gravity adaptation (more stable)
+# optional smoothing of linear accel for nicer velocity integration
+A_LIN_LP_ALPHA = 0.25
 
-# -------------------------
-# Apogee detection (orientation-agnostic "up" from resultant acceleration direction)
-# -------------------------
-# Idea:
-# - Define the rocket's "up axis" as the direction of the measured acceleration vector in world frame
-#   during powered/ascent. This adapts automatically to orientation.
-# - Remove gravity to estimate linear acceleration, project onto that "up axis", integrate to get v_up.
-# - Detect apogee when v_up falls from positive to ~0 after being clearly positive.
-#
-# Notes:
-# - Accel-only apogee is NOT as robust as barometer apogee.
-# - For hand tests ("move up then stop"), this works much better than free-fall logic.
-#
-ACC_LP = 0.25          # accel low-pass (0..1), higher = more responsive
-VEL_LEAK = 0.02        # 0..1 per update (leaky integrator to limit drift)
-VEL_ARM = 0.30         # m/s: must exceed this upward speed to "arm"
-VEL_APOGEE = 0.05      # m/s: apogee when v_up drops below this
-APOGEE_HOLD = 0.15     # s: must stay below threshold continuously
+# leaky integrator to reduce drift (0..1 per update)
+VEL_LEAK = 0.02
 
-# How quickly the "up axis" adapts to new direction (0..1)
-UP_AXIS_ALPHA = 0.08   # small = stable, large = very reactive
-
-# Hysteresis reset (optional) – if you want it to re-arm automatically
-RESET_VEL = 0.50       # m/s: if v_up becomes strongly positive again, reset apogee_detected
-
+# ---------- Omnidirectional "apogee" logic ----------
+VEL_ARM = 0.40       # m/s : arm when |v| exceeds this
+VEL_ZERO = 0.10      # m/s : apogee when |v| falls below this
+HOLD_SEC = 0.18      # seconds: must stay below VEL_ZERO
+RESET_VEL = 0.65     # m/s : optional reset for repeated tests
 
 # =========================
 # Port selection
@@ -75,7 +61,6 @@ def auto_pick_usb_port():
         if "bluetooth" not in (p.description or "").lower():
             return p.device
     return ports[0].device
-
 
 # =========================
 # Quaternion helpers
@@ -150,30 +135,6 @@ def apply_rotmat(R, body, x_axis, y_axis, z_axis):
     y_axis.pos = vector(0,0,0); y_axis.axis = 1.2 * ey
     z_axis.pos = vector(0,0,0); z_axis.axis = 1.2 * ez
 
-
-# =========================
-# Vector helpers
-# =========================
-def v_norm(x, y, z):
-    n = math.sqrt(x*x + y*y + z*z)
-    if n < 1e-12:
-        return (0.0, 0.0, 0.0, 0.0)
-    return (x/n, y/n, z/n, n)
-
-def v_dot(a, b):
-    return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]
-
-def v_lerp_unit(u_old, u_new, alpha):
-    # Blend then renormalize
-    x = (1-alpha)*u_old[0] + alpha*u_new[0]
-    y = (1-alpha)*u_old[1] + alpha*u_new[1]
-    z = (1-alpha)*u_old[2] + alpha*u_new[2]
-    unx, uny, unz, n = v_norm(x, y, z)
-    if n < 1e-12:
-        return u_old
-    return (unx, uny, unz)
-
-
 # =========================
 # Serial setup
 # =========================
@@ -198,44 +159,43 @@ def read_latest_line():
             latest = line
     return latest
 
-
 # =========================
-# VPython scene + status boxes
+# VPython scene
 # =========================
 scene = canvas(
-    title=f"BMI160 Viewer + Apogee (Up from resultant accel) | yaw offset {MODEL_YAW_OFFSET_DEG:.0f}°",
-    width=1200, height=740,
+    title=f"Omnidirectional Apogee Viewer | yaw offset {MODEL_YAW_OFFSET_DEG:.0f}°",
+    width=1250, height=760,
     background=vector(0.95, 0.95, 0.95)
 )
 
-# Model and axes
 body = box(size=vector(2, 0.25, 0.6), color=vector(0.2, 0.2, 0.2))
 x_axis = arrow(color=color.blue,  shaftwidth=0.05)
 y_axis = arrow(color=color.green, shaftwidth=0.05)
 z_axis = arrow(color=color.red,   shaftwidth=0.05)
 
-# Accel resultant arrow (orange)
+# Orange = raw accel resultant (includes gravity)
 acc_arrow = arrow(color=vector(1.0, 0.6, 0.0), shaftwidth=0.08)
-acc_arrow.pos = vector(0, 0, 0)
-acc_arrow.axis = vector(0, 0, 0)
+# Cyan = linear accel (gravity removed)
+lin_arrow = arrow(color=vector(0.0, 0.7, 1.0), shaftwidth=0.06)
+# White = velocity vector
+vel_arrow = arrow(color=vector(0.1, 0.1, 0.1), shaftwidth=0.06)
 
-# "Up axis" arrow (purple) – estimated ascent direction
-up_arrow = arrow(color=vector(0.6, 0.2, 0.8), shaftwidth=0.06)
-up_arrow.pos = vector(0, 0, 0)
-up_arrow.axis = vector(0, 0, 0)
+for a in (acc_arrow, lin_arrow, vel_arrow):
+    a.pos = vector(0, 0, 0)
+    a.axis = vector(0, 0, 0)
 
-# Status "highlight boxes"
-flight_box = box(pos=vector(-3.4, 2.4, 0), size=vector(3.2, 0.95, 0.02),
+# Status boxes
+flight_box = box(pos=vector(-3.5, 2.45, 0), size=vector(3.3, 0.95, 0.02),
                  color=color.red, opacity=0.35)
-apogee_box = box(pos=vector(3.4, 2.4, 0), size=vector(3.2, 0.95, 0.02),
+apogee_box = box(pos=vector(3.5, 2.45, 0), size=vector(3.3, 0.95, 0.02),
                  color=color.green, opacity=0.08)
 
 flight_lbl = label(pos=flight_box.pos, text="IN FLIGHT", height=16, box=False, color=color.black)
 apogee_lbl = label(pos=apogee_box.pos, text="APOGEE MODE", height=16, box=False, color=color.black)
 
-txt = label(pos=vector(0, 1.65, 0), text="", height=14, box=False, color=color.black)
+txt = label(pos=vector(0, 1.75, 0), text="", height=14, box=False, color=color.black)
 
-print("\nExpected serial format (required for apogee):")
+print("\nExpected serial format:")
 print("DMPSTYLE,qw,qx,qy,qz,yaw,pitch,roll,ax,ay,az,amag\n")
 
 # =========================
@@ -244,132 +204,126 @@ print("DMPSTYLE,qw,qx,qy,qz,yaw,pitch,roll,ax,ay,az,amag\n")
 q_prev = (1.0, 0.0, 0.0, 0.0)
 q_disp = (1.0, 0.0, 0.0, 0.0)
 
-# Up axis estimate in WORLD frame (unit vector)
-# Initialize to +Z
-u_up = (0.0, 0.0, 1.0)
-
-# Vertical (along u_up) linear accel and velocity
-a_up_lp = 0.0
-v_up = 0.0
+# gravity estimate in world frame
+g_est = [0.0, 0.0, 9.8]   # initial guess
+# filtered linear accel
+a_lin_lp = [0.0, 0.0, 0.0]
+# velocity estimate
+v_vec = [0.0, 0.0, 0.0]
 
 armed = False
 apogee_detected = False
 below_start = None
+v_peak = 0.0
+
 last_t = time.time()
 
-# =========================
-# Main loop
-# =========================
+def vec_norm(x, y, z):
+    n = math.sqrt(x*x + y*y + z*z)
+    if n < 1e-12:
+        return (0.0, 0.0, 0.0, 0.0)
+    return (x/n, y/n, z/n, n)
+
 while True:
     rate(60)
 
     line = read_latest_line()
-    if not line:
-        continue
-    if not line.startswith("DMPSTYLE,"):
+    if not line or not line.startswith("DMPSTYLE,"):
         continue
 
     parts = line.split(",")
     if len(parts) < 12:
-        # no accel fields -> can't do apogee
         continue
 
-    # Parse quaternion + ypr + accel
     try:
         qw = float(parts[1]); qx = float(parts[2]); qy = float(parts[3]); qz = float(parts[4])
         yaw = float(parts[5]); pitch = float(parts[6]); roll = float(parts[7])
         ax = float(parts[8]); ay = float(parts[9]); az = float(parts[10])
-        amag_body = float(parts[11])
+        _amag = float(parts[11])
     except ValueError:
         continue
 
     q_new = quat_norm((qw, qx, qy, qz))
 
-    # Prevent sudden quaternion sign flips
+    # quaternion continuity
     if quat_dot(q_prev, q_new) < 0.0:
         q_new = (-q_new[0], -q_new[1], -q_new[2], -q_new[3])
     q_prev = q_new
 
-    # Smooth quaternion for display
+    # smooth display quaternion
     q_disp = quat_lerp(q_disp, q_new, Q_ALPHA)
 
-    # Apply model yaw offset
+    # apply model yaw offset
     q_render = quat_mul(Q_MODEL, q_disp)
 
-    # Rotate model
+    # rotate model
     R = quat_to_rotmat(q_render)
     apply_rotmat(R, body, x_axis, y_axis, z_axis)
 
-    # Rotate accel into world frame
+    # accel to world frame
     axw, ayw, azw = rotate_vec_by_quat((ax, ay, az), q_render)
 
-    # Resultant accel arrow in world frame
-    ux, uy, uz, a_mag = v_norm(axw, ayw, azw)
-    acc_arrow.axis = vector(ux, uy, uz) * (ACC_SCALE * a_mag)
-
-    # -------------------------
-    # Estimate "Up" direction from resultant accel direction (orientation agnostic)
-    # -------------------------
-    # During ascent/powered motion, measured accel tends to point along thrust/up direction (plus gravity).
-    # Use the direction of a_world as a proxy for "up" and smooth it.
-    if a_mag > 1.0:  # ignore very small magnitudes (noisy)
-        # Keep u_up continuous (avoid sign flips)
-        if v_dot(u_up, (ux, uy, uz)) < 0.0:
-            ux, uy, uz = -ux, -uy, -uz
-        u_up = v_lerp_unit(u_up, (ux, uy, uz), UP_AXIS_ALPHA)
-
-    # Draw up axis arrow (purple)
-    up_arrow.axis = vector(u_up[0], u_up[1], u_up[2]) * 1.2
-
-    # -------------------------
-    # Linear acceleration along "up"
-    # -------------------------
-    # Remove gravity vector projected onto u_up.
-    # Gravity in world frame is (0,0,-G0) if Z is up. But we do NOT assume which axis is up globally here.
-    # Instead: we treat gravity magnitude as G0 and remove its component along u_up by assuming gravity is opposite
-    # the long-term average accel when stationary. Since we don't have that calibration here,
-    # we approximate gravity projection as +G0 * cos(theta) where theta between u_up and gravity direction.
-    #
-    # Practical approach without magnetometer:
-    # - Use the component of measured accel along u_up and subtract G0 (because when stationary,
-    #   accel along any axis aligned with gravity is ~+G0).
-    #
-    # This works well for "move up then stop" tests and simple ascent/coast transitions.
-    a_along_up = v_dot((axw, ayw, azw), u_up)   # includes gravity
-    a_lin_up = a_along_up - G0                 # approximate remove 1g along that axis
-
-    # Filter + integrate velocity (leaky to limit drift)
+    # --- time step ---
     nowt = time.time()
     dt = nowt - last_t
     last_t = nowt
     if dt <= 0 or dt > 0.2:
         dt = 1/60.0
 
-    a_up_lp = a_up_lp + ACC_LP * (a_lin_up - a_up_lp)
-    v_up = (1.0 - VEL_LEAK) * v_up + a_up_lp * dt
+    # --- gravity estimate (slow LPF of a_world) ---
+    g_est[0] += G_LP_ALPHA * (axw - g_est[0])
+    g_est[1] += G_LP_ALPHA * (ayw - g_est[1])
+    g_est[2] += G_LP_ALPHA * (azw - g_est[2])
 
-    # -------------------------
-    # Apogee detection: after "armed" by clear upward velocity, trigger when v_up ~ 0
-    # -------------------------
-    if not armed and v_up > VEL_ARM:
+    # --- linear accel (gravity removed) ---
+    a_lin = [axw - g_est[0], ayw - g_est[1], azw - g_est[2]]
+
+    # filter linear accel a bit (optional)
+    a_lin_lp[0] += A_LIN_LP_ALPHA * (a_lin[0] - a_lin_lp[0])
+    a_lin_lp[1] += A_LIN_LP_ALPHA * (a_lin[1] - a_lin_lp[1])
+    a_lin_lp[2] += A_LIN_LP_ALPHA * (a_lin[2] - a_lin_lp[2])
+
+    # --- integrate to velocity (leaky) ---
+    v_vec[0] = (1.0 - VEL_LEAK) * v_vec[0] + a_lin_lp[0] * dt
+    v_vec[1] = (1.0 - VEL_LEAK) * v_vec[1] + a_lin_lp[1] * dt
+    v_vec[2] = (1.0 - VEL_LEAK) * v_vec[2] + a_lin_lp[2] * dt
+
+    # magnitudes + unit vectors for arrows
+    axu, ayu, azu, a_mag = vec_norm(axw, ayw, azw)
+    lxu, lyu, lzu, l_mag = vec_norm(a_lin_lp[0], a_lin_lp[1], a_lin_lp[2])
+    vxu, vyu, vzu, v_mag = vec_norm(v_vec[0], v_vec[1], v_vec[2])
+
+    # draw arrows
+    acc_arrow.axis = vector(axu, ayu, azu) * (ACC_SCALE * a_mag) if a_mag > 1e-9 else vector(0,0,0)
+    lin_arrow.axis = vector(lxu, lyu, lzu) * (LIN_SCALE * l_mag) if l_mag > 1e-9 else vector(0,0,0)
+    vel_arrow.axis = vector(vxu, vyu, vzu) * (VEL_SCALE * v_mag) if v_mag > 1e-9 else vector(0,0,0)
+
+    # =========================
+    # Omnidirectional apogee detection using speed |v|
+    # =========================
+    if not armed and v_mag > VEL_ARM:
         armed = True
+        v_peak = v_mag
+        below_start = None
 
     if armed and not apogee_detected:
-        if v_up < VEL_APOGEE:
+        v_peak = max(v_peak, v_mag)
+        if v_mag < VEL_ZERO:
             if below_start is None:
                 below_start = nowt
-            elif (nowt - below_start) >= APOGEE_HOLD:
+            elif (nowt - below_start) >= HOLD_SEC:
                 apogee_detected = True
         else:
             below_start = None
 
-    # Optional reset for repeated tests
-    if apogee_detected and v_up > RESET_VEL:
+    # Optional reset for repeated manual tests
+    if apogee_detected and v_mag > RESET_VEL:
         apogee_detected = False
         armed = True
         below_start = None
+        v_peak = v_mag
 
-    # Update highlight boxes
+    # update status boxes
     if apogee_detected:
         flight_box.opacity = 0.08
         apogee_box.opacity = 0.35
@@ -380,6 +334,6 @@ while True:
     txt.text = (
         f"Port: {PORT}\n"
         f"Yaw {yaw:.1f}°  Pitch {pitch:.1f}°  Roll {roll:.1f}°\n"
-        f"|a|={a_mag:.2f} m/s²   a_up={a_lin_up:+.2f} m/s²\n"
-        f"v_up={v_up:+.2f} m/s   Armed={'YES' if armed else 'NO'}   Apogee={'YES' if apogee_detected else 'NO'}"
+        f"|a|={a_mag:.2f} m/s²  |a_lin|={l_mag:.2f} m/s²  |v|={v_mag:.2f} m/s (peak {v_peak:.2f})\n"
+        f"Armed={'YES' if armed else 'NO'}   Apogee={'YES' if apogee_detected else 'NO'}"
     )
