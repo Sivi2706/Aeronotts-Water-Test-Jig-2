@@ -8,7 +8,7 @@
 static bool R4LoRaOk = false;
 
 // SX127x register addresses
-static constexpr uint8_t REG_VERSION = 0x42;
+static constexpr uint8_t REG_VERSION      = 0x42;
 static constexpr uint8_t EXPECTED_VERSION = 0x12; // typical for SX1278/76 family
 
 static void loraResetPulse() {
@@ -77,6 +77,10 @@ bool r4LoRaRx_begin(long frequency_hz) {
   LoRa.setCodingRate4(5);
   LoRa.enableCrc();
 
+  // FIX 1: explicitly enter continuous receive mode after init
+  // Without this, the radio may sit idle and miss packets
+  LoRa.receive();
+
   return true;
 }
 
@@ -89,5 +93,11 @@ bool r4LoRaRx_receiveLine(String& outLine, int& outRssi) {
   outLine = "";
   while (LoRa.available()) outLine += (char)LoRa.read();
   outRssi = LoRa.packetRssi();
+
+  // FIX 2: re-arm the receiver after each packet is read
+  // SX1278 returns to standby after parsePacket() reads a frame.
+  // Calling LoRa.receive() puts it back into continuous RX mode.
+  LoRa.receive();
+
   return true;
 }
