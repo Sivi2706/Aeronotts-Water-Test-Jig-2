@@ -29,6 +29,25 @@ bool SDLogger::createNextDatalogDir() {
   return false;
 }
 
+static void writeHeaderBlock(File& f,
+                             const char* title,
+                             const char* dtypes,
+                             const char* units,
+                             const char* columns) {
+  // 3 metadata rows + 1 column header row
+  f.print("# Title,");
+  f.println(title);
+
+  f.print("# DTypes,");
+  f.println(dtypes);
+
+  f.print("# Units,");
+  f.println(units);
+
+  f.println(columns);
+  f.flush();
+}
+
 bool SDLogger::openCSVFiles(ErrorState& errs) {
   _imuFile  = SD.open(makePath(_datalogDir, IMU_CSV_NAME),  FILE_APPEND);
   _baroFile = SD.open(makePath(_datalogDir, BARO_CSV_NAME), FILE_APPEND);
@@ -40,22 +59,50 @@ bool SDLogger::openCSVFiles(ErrorState& errs) {
     return false;
   }
 
+  // ========================= IMU CSV =========================
   if (_imuFile.size() == 0) {
-    _imuFile.println("t_ms,ax_ms2,ay_ms2,az_ms2,gx_rad,gy_rad,gz_rad,accMag_ms2,valid");
-    _imuFile.flush();
+    writeHeaderBlock(
+      _imuFile,
+      "Accelerometer + Gyroscope Raw Data",
+      "uint32,float,float,float,float,float,float,float,bool",
+      "ms,m/s^2,m/s^2,m/s^2,rad/s,rad/s,rad/s,m/s^2,0/1",
+      "t_ms,ax_ms2,ay_ms2,az_ms2,gx_rad,gy_rad,gz_rad,accMag_ms2,valid"
+    );
   }
+
+  // ========================= BARO CSV =========================
   if (_baroFile.size() == 0) {
-    _baroFile.println("t_ms,temp_C,press_hPa,absAlt_m,relAlt_m,valid");
-    _baroFile.flush();
+    writeHeaderBlock(
+      _baroFile,
+      "Barometer + Temperature Raw Data",
+      "uint32,float,float,float,float,bool",
+      "ms,degC,hPa,m,m,0/1",
+      "t_ms,temp_C,press_hPa,absAlt_m,relAlt_m,valid"
+    );
   }
+
+  // ========================= GPS CSV =========================
   if (_gpsFile.size() == 0) {
-    _gpsFile.println("t_ms,lat,lon,alt_m,sats,hdop,hasFix,coord_dms,lastGGA,lastRMC");
-    _gpsFile.flush();
+    writeHeaderBlock(
+      _gpsFile,
+      "GPS Raw Data + Processed Coordinates (DMS)",
+      "uint32,double,double,double,uint32,double,bool,string,string,string",
+      "ms,deg,deg,m,count,unitless,0/1,text,text,text",
+      "t_ms,lat,lon,alt_m,sats,hdop,hasFix,coord_dms,lastGGA,lastRMC"
+    );
   }
+
+  // ========================= ERROR CSV =========================
   if (_errFile.size() == 0) {
-    _errFile.println("t_ms,sd,lora,bmp,bmi,gps");
-    _errFile.flush();
+    writeHeaderBlock(
+      _errFile,
+      "Error Event Log (component error codes)",
+      "uint32,string,string,string,string,string",
+      "ms,code,code,code,code,code",
+      "t_ms,sd,lora,bmp,bmi,gps"
+    );
   }
+
   return true;
 }
 
@@ -110,7 +157,11 @@ void SDLogger::flushEvery(uint32_t nTicks) {
   _flushEvery = (nTicks == 0) ? 1 : nTicks;
 }
 
-void SDLogger::writeTick(uint32_t t_ms, const IMUState& imu, const BaroState& baro, const GPSState& gps, const ErrorState& errs) {
+void SDLogger::writeTick(uint32_t t_ms,
+                         const IMUState& imu,
+                         const BaroState& baro,
+                         const GPSState& gps,
+                         const ErrorState& errs) {
   // IMU
   if (_imuFile) {
     _imuFile.printf("%lu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%d\n",
