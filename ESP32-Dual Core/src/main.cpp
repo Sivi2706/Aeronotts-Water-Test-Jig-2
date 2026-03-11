@@ -24,7 +24,7 @@ static constexpr BaseType_t CORE_SENS_LOG = 1; // Core1
 static constexpr uint32_t LOG_HZ = 10;
 static constexpr uint32_t LOG_PERIOD_MS = 1000 / LOG_HZ;
 
-// Sensor internal sampling (updates “latest” values)
+// Sensor internal sampling (updates "latest" values)
 static constexpr uint32_t IMU_HZ  = 50;
 static constexpr uint32_t BARO_HZ = 25;
 
@@ -36,7 +36,7 @@ static constexpr long LORA_FREQ_HZ = 433E6;     // <-- match R4
 static constexpr int  LORA_TX_PWR  = 17;
 static constexpr bool ENABLE_LORA_TELEMETRY = true;
 
-// How often to send the “GPS telemetry line” (in addition to other logs)
+// How often to send the GPS telemetry line over LoRa — 1 packet/s
 static constexpr uint32_t LORA_TLM_HZ = 1;
 
 // BMP280
@@ -46,8 +46,10 @@ static constexpr float SEA_LEVEL_HPA = 1013.25f;
 // BMI160
 static constexpr uint8_t BMI_ADDR = 0x69;
 
-// Optional: limit how often Core1 prints its heartbeat line (prevents LoRa spam)
-static constexpr uint32_t CORE1_PRINT_HZ = 2; // set to 0 to disable rate limit
+// Core1 sensor/IMU debug line rate over LoRa.
+// Set to 0 to disable entirely so only the GPS line is sent (1 packet/s total).
+// Set to 1 to also send 1 CORE1_LOG line/s (giving 2 packets/s total).
+static constexpr uint32_t CORE1_PRINT_HZ = 0; // <-- changed from 2 to 0
 
 // ======================================================
 //                   GLOBAL MODULES
@@ -106,7 +108,7 @@ static void taskGPSandRF(void* pv) {
     // 2) Push frames to Core1 at fixed rate
     gpsMgr.emitFrameIfDue(gpsQ, GPS_FRAME_HZ);
 
-    // 3) Optional telemetry line at 1 Hz (also mirrored to Serial+LoRa)
+    // 3) GPS telemetry line at LORA_TLM_HZ (1/s)
     if (ENABLE_LORA_TELEMETRY && loraOK) {
       const uint32_t now = millis();
       if (now - lastTlmMs >= tlmPeriodMs) {
@@ -114,9 +116,7 @@ static void taskGPSandRF(void* pv) {
 
         const GPSState& g = gpsMgr.latest();
 
-        // A clean “status line” that the R4 will print
-        // Format: T(ms),FIX,LAT,LON,ALT,HDOP,SATS
-        // This is NOT required for mirroring, but useful.
+        // Format: GPS,T(ms),FIX,LAT,LON,ALT,HDOP,SATS
         String line;
         line.reserve(140);
         line += "GPS,";
@@ -171,7 +171,7 @@ static void taskSensorsAndLogging(void* pv) {
   uint32_t lastBAROms = 0;
   uint32_t lastLOGms  = 0;
 
-  // Rate limit for Core1 debug line
+  // Rate limit for Core1 debug line over LoRa
   uint32_t lastCore1PrintMs = 0;
   const uint32_t core1PrintPeriodMs =
     (CORE1_PRINT_HZ == 0) ? 0 : (1000UL / CORE1_PRINT_HZ);
@@ -214,9 +214,11 @@ static void taskSensorsAndLogging(void* pv) {
         sdlog.writeTick(now, imuLatest, baroLatest, gpsLatest, errs);
       }
 
-      // This is the line you previously printed to Serial.
-      // Now it is mirrored to LoRa too (rate-limited).
-      if (core1PrintPeriodMs == 0 || (now - lastCore1PrintMs >= core1PrintPeriodMs)) {
+      // CORE1_LOG line — only sent if CORE1_PRINT_HZ > 0
+      // With CORE1_PRINT_HZ = 0 this block is never entered,
+      // keeping LoRa output to exactly 1 packet/s (GPS line only).
+      if (core1PrintPeriodMs > 0 &&
+          (now - lastCore1PrintMs >= core1PrintPeriodMs)) {
         lastCore1PrintMs = now;
 
         MLOGF("CORE1_LOG,%lu,IMU=%d,BARO=%d,GPSfix=%d,ALTrel=%.2f,AccMag=%.2f,ERR(bmp=%s,bmi=%s,gps=%s)",
